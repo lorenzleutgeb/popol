@@ -45,40 +45,102 @@
 #![allow(clippy::new_without_default)]
 #![allow(clippy::comparison_chain)]
 use std::io;
-use std::io::prelude::*;
 use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 pub use interest::Interest;
 
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+
+#[cfg(unix)]
+mod os {
+    pub use std::os::unix::io::{AsRawFd as AsRaw, FromRawFd as FromRaw, RawFd as Raw};
+
+    use libc as raw;
+
+    pub use raw::c_short as Events;
+    pub use raw::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLPRI, POLLOUT, POLLWRBAND};
+
+    pub(crate) use raw::{poll, pollfd as PollFd};
+}
+
+#[cfg(windows)]
+mod os {
+    pub use std::os::windows::io::{AsRawSocket as AsRaw, FromRawSocket as FromRaw, RawSocket as Raw};
+
+    pub(crate) use ::windows::Win32::Networking::WinSock as raw;
+
+    pub use raw::WSAPOLL_EVENT_FLAGS as Events;
+    pub use raw::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
+
+    pub(crate) use raw::{WSAPoll as poll, WSAPOLLFD as PollFd};
+}
+
+use os::*;
+
 /// Raw input or output events.
-pub type Events = libc::c_short;
+pub type Events = os::Events;
 
 /// Source readiness interest.
 pub mod interest {
+    use super::os;
+
     /// Events that can be waited for.
-    pub type Interest = super::Events;
+    pub type Interest = os::Events;
+
+    const fn into(value: i16) -> Interest {
+        #[cfg(unix)]
+        return value;
+
+        #[cfg(windows)]
+        return os::Events(value);
+    }
+
+    /// Helper function to allow for const operations on [`Interest`],
+    /// which would otherwise not be possible on Windows.
+    const fn from(value: Interest) -> i16 {
+        #[cfg(unix)]
+        return value;
+
+        #[cfg(windows)]
+        return value.0;
+    }
 
     /// The associated file is ready to be read.
+    #[cfg(unix)]
     pub const READ: Interest = POLLIN | POLLPRI;
+
+    /// The associated file is ready to be read.
+    #[cfg(windows)]
+    pub const READ: Interest = POLLIN;
+
     /// The associated file is ready to be written.
-    pub const WRITE: Interest = POLLOUT | libc::POLLWRBAND;
+    #[cfg(unix)]
+    pub const WRITE: Interest = POLLOUT | os::POLLWRBAND;
+
+    /// The associated file is ready to be written.
+    #[cfg(windows)]
+    pub const WRITE: Interest = POLLOUT;
+
     /// The associated file is ready.
-    pub const ALL: Interest = READ | WRITE;
+    pub const ALL: Interest = into(from(READ) | from(WRITE));
+
     /// Don't wait for any events.
-    pub const NONE: Interest = 0x0;
+    pub const NONE: Interest = into(0);
 
     // NOTE: POLLERR, POLLNVAL and POLLHUP are ignored as *interests*, and will
     // always be set automatically in the output events.
 
     /// The associated file is available for read operations.
-    const POLLIN: Interest = libc::POLLIN;
+    const POLLIN: Interest = os::POLLIN;
+
     /// There is urgent data available for read operations.
-    const POLLPRI: Interest = libc::POLLPRI;
+    #[cfg(unix)]
+    const POLLPRI: Interest = os::POLLPRI;
+
     /// The associated file is available for write operations.
-    const POLLOUT: Interest = libc::POLLOUT;
+    const POLLOUT: Interest = os::POLLOUT;
 }
 
 /// An I/O ready event.
@@ -147,21 +209,48 @@ impl From<Option<Duration>> for Timeout {
     }
 }
 
+#[cfg(unix)]
+macro_rules! as_raw {
+    ($fd:expr) => {
+        $fd.as_raw_fd()
+    };
+}
+
+#[cfg(windows)]
+macro_rules! as_raw {
+    ($fd:expr) => {
+        $fd.as_raw_socket()
+    };
+}
+
 /// A source of readiness events, eg. a `net::TcpStream`.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Default)]
 pub struct Source {
-    fd: RawFd,
+    fd: Raw,
     events: Interest,
     revents: Interest,
 }
 
+/// A compile-time check that the shape of [`Source`] is the same
+/// as that of [`PollFd`] (which is platform-dependent).
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+
+    ["Size of Source"][size_of::<Source>() - size_of::<PollFd>()];
+    ["Alignment of Source"][align_of::<Source>() - align_of::<PollFd>()];
+    ["Offset of Source::fd"][offset_of!(Source, fd) - offset_of!(PollFd, fd)];
+    ["Offset of Source::events"][offset_of!(Source, events) - offset_of!(PollFd, events)];
+    ["Offset of Source::revents"][offset_of!(Source, revents) - offset_of!(PollFd, revents)];
+};
+
 impl Source {
-    fn new(fd: impl AsRawFd, events: Interest) -> Self {
+    fn new(fd: Raw, events: Interest) -> Self {
         Self {
-            fd: fd.as_raw_fd(),
+            fd,
             events,
-            revents: 0,
+            revents: interest::NONE,
         }
     }
 
@@ -169,10 +258,22 @@ impl Source {
     ///
     /// # Safety
     ///
-    /// Calls [`FromRawFd::from_raw_fd`]. The returned object will cause
+    /// Calls [`FromRaw::from_raw_fd`]. The returned object will cause
     /// the file to close when dropped.
-    pub unsafe fn raw<T: FromRawFd>(&self) -> T {
+    #[cfg(unix)]
+    pub unsafe fn raw<T: FromRaw>(&self) -> T {
         T::from_raw_fd(self.fd)
+    }
+
+    /// Return the source from the underlying raw file descriptor.
+    ///
+    /// # Safety
+    ///
+    /// Calls [`FromRaw::from_raw_socket`]. The returned object will cause
+    /// the file to close when dropped.
+    #[cfg(windows)]
+    pub unsafe fn raw<T: FromRaw>(&self) -> T {
+        T::from_raw_socket(self.fd)
     }
 
     /// Set events to wait for on this source.
@@ -192,17 +293,17 @@ impl Source {
 
     /// The source is writable.
     pub fn is_writable(self) -> bool {
-        self.revents & interest::WRITE != 0
+        self.revents & interest::WRITE != interest::NONE
     }
 
     /// The source is readable.
     pub fn is_readable(self) -> bool {
-        self.revents & interest::READ != 0
+        self.revents & interest::READ != interest::NONE
     }
 
     /// The source has been disconnected.
     pub fn is_hangup(self) -> bool {
-        self.revents & libc::POLLHUP != 0
+        self.revents & os::POLLHUP != interest::NONE
     }
 
     /// An error has occurred on the source.
@@ -210,23 +311,35 @@ impl Source {
     /// Note that this function is best used in combination with
     /// [`Self::is_invalid`], to detect all error cases.
     pub fn is_error(self) -> bool {
-        self.revents & libc::POLLERR != 0
+        self.revents & os::POLLERR != interest::NONE
     }
 
     /// The source is not valid.
     pub fn is_invalid(self) -> bool {
-        self.revents & libc::POLLNVAL != 0
+        self.revents & os::POLLNVAL != interest::NONE
     }
 }
 
-impl AsRawFd for &Source {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsRaw for &Source {
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Raw {
+        self.fd
+    }
+
+    #[cfg(windows)]
+    fn as_raw_socket(&self) -> Raw {
         self.fd
     }
 }
 
-impl AsRawFd for Source {
-    fn as_raw_fd(&self) -> RawFd {
+impl AsRaw for Source {
+    #[cfg(unix)]
+    fn as_raw_fd(&self) -> Raw {
+        self.fd
+    }
+
+    #[cfg(windows)]
+    fn as_raw_socket(&self) -> Raw {
         self.fd
     }
 }
@@ -269,7 +382,7 @@ impl<K> Sources<K> {
     }
 }
 
-impl<S: AsRawFd, K: PartialEq + Eq + Clone> FromIterator<(K, S, Interest)> for Sources<K> {
+impl<S: AsRaw, K: PartialEq + Eq + Clone> FromIterator<(K, S, Interest)> for Sources<K> {
     fn from_iter<T: IntoIterator<Item = (K, S, Interest)>>(iter: T) -> Self {
         let mut sources = Sources::new();
         for (key, source, interest) in iter {
@@ -284,8 +397,8 @@ impl<K: Clone + PartialEq> Sources<K> {
     ///
     /// Care must be taken not to register the same source twice, or use the same key
     /// for two different sources.
-    pub fn register(&mut self, key: K, fd: &impl AsRawFd, events: Interest) {
-        self.insert(key, Source::new(fd.as_raw_fd(), events));
+    pub fn register(&mut self, key: K, fd: &impl AsRaw, events: Interest) {
+        self.insert(key, Source::new(as_raw!(fd), events));
     }
 
     /// Unregister a  source, given its key.
@@ -349,9 +462,12 @@ impl<K: Clone + PartialEq> Sources<K> {
         loop {
             // SAFETY: required for FFI; shouldn't break rust guarantees.
             let result = unsafe {
-                libc::poll(
-                    self.list.as_mut_ptr() as *mut libc::pollfd,
-                    self.list.len() as libc::nfds_t,
+                poll(
+                    self.list.as_mut_ptr() as *mut PollFd,
+                    self.list
+                        .len()
+                        .try_into()
+                        .expect("nfds types are expected to be equivalent"),
                     timeout,
                 )
             };
@@ -360,7 +476,7 @@ impl<K: Clone + PartialEq> Sources<K> {
                 self.index
                     .iter()
                     .zip(self.list.iter())
-                    .filter(|(_, s)| s.revents != 0)
+                    .filter(|(_, s)| s.revents != interest::NONE)
                     .map(|(key, source)| Event {
                         key: key.clone(),
                         source: *source,
@@ -375,21 +491,47 @@ impl<K: Clone + PartialEq> Sources<K> {
                 }
             } else if result > 0 {
                 return Ok(result as usize);
-            } else {
-                let err = io::Error::last_os_error();
-                match err.raw_os_error() {
-                    // Poll can fail if "The allocation of internal data structures failed". But
-                    // a subsequent request may succeed.
-                    Some(libc::EAGAIN) => continue,
-                    // Poll can also fail if it received an interrupt. It's a good idea to retry
-                    // in that case.
-                    Some(libc::EINTR) => continue,
-                    _ => {
-                        return Err(err);
-                    }
-                }
+            } else if let Some(err) = Self::err() {
+                return Err(err);
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn err() -> Option<io::Error> {
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // Poll can fail if "The allocation of internal data structures failed". But
+            // a subsequent request may succeed.
+            Some(libc::EAGAIN) => None,
+            // Poll can also fail if it received an interrupt. It's a good idea to retry
+            // in that case.
+            Some(libc::EINTR) => None,
+            _ => Some(err)
+        }
+    }
+
+    /// See <https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsapoll>
+    #[cfg(windows)]
+    fn err() -> Option<io::Error> {
+        use io::ErrorKind::*;
+        use os::raw::*;
+
+        let (kind, msg) = match unsafe { WSAGetLastError() } {
+            WSAENETDOWN => (NotConnected, "The network subsystem has failed."),
+            WSAEFAULT => (
+                InvalidInput,
+                "An exception occurred while reading user input parameters.",
+            ),
+            WSAEINVAL => (InvalidInput, "An invalid parameter was passed."),
+            WSAENOBUFS => (
+                OutOfMemory,
+                "The function was unable to allocate sufficient memory.",
+            ),
+            _ => unreachable!(),
+        };
+
+        Some(io::Error::new(kind, format!("WSAPoll: {}", msg)))
     }
 
     /// Wait for readiness events on the given list of sources. If no event
@@ -425,23 +567,27 @@ impl<K: Clone + PartialEq> Sources<K> {
 }
 
 /// Wakers are used to wake up `wait`.
+#[cfg(unix)]
 pub struct Waker {
     reader: UnixStream,
     writer: UnixStream,
 }
 
-impl AsRawFd for &Waker {
-    fn as_raw_fd(&self) -> RawFd {
+#[cfg(unix)]
+impl AsRaw for &Waker {
+    fn as_raw_fd(&self) -> Raw {
         self.reader.as_raw_fd()
     }
 }
 
-impl AsRawFd for Waker {
-    fn as_raw_fd(&self) -> RawFd {
+#[cfg(unix)]
+impl AsRaw for Waker {
+    fn as_raw_fd(&self) -> Raw {
         self.reader.as_raw_fd()
     }
 }
 
+#[cfg(unix)]
 impl Waker {
     /// Create a new `Waker` and register it.
     ///
@@ -493,7 +639,7 @@ impl Waker {
     /// ```
     pub fn register<K: Eq + Clone>(sources: &mut Sources<K>, key: K) -> io::Result<Waker> {
         let waker = Waker::new()?;
-        sources.insert(key, Source::new(&waker, interest::READ));
+        sources.insert(key, Source::new(as_raw!(&waker), interest::READ));
 
         Ok(waker)
     }
@@ -511,7 +657,7 @@ impl Waker {
     /// Wake up a waker. Causes `popol::wait` to return with a readiness
     /// event for this waker.
     pub fn wake(&self) -> io::Result<()> {
-        use io::ErrorKind::*;
+        use io::{ErrorKind::*, Write as _};
 
         match (&self.writer).write_all(&[0x1]) {
             Ok(_) => Ok(()),
@@ -525,7 +671,7 @@ impl Waker {
     }
 
     /// Reset the waker by draining the receive buffer.
-    pub fn reset(fd: impl AsRawFd) -> io::Result<()> {
+    pub fn reset(fd: impl AsRaw) -> io::Result<()> {
         let mut buf = [0u8; 4096];
 
         loop {
@@ -573,7 +719,8 @@ impl Waker {
 ///
 /// On Linux, this should always return `Ok(0)` or `Err(_)`. On other operating systems,
 /// consult the `fcntl(2)` man page.
-pub fn set_nonblocking(fd: &dyn AsRawFd, nonblocking: bool) -> io::Result<i32> {
+#[cfg(unix)]
+pub fn set_nonblocking(fd: &dyn AsRaw, nonblocking: bool) -> io::Result<i32> {
     let fd = fd.as_raw_fd();
 
     // SAFETY: required for FFI; shouldn't break rust guarantees.
@@ -595,12 +742,14 @@ pub fn set_nonblocking(fd: &dyn AsRawFd, nonblocking: bool) -> io::Result<i32> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[allow(clippy::unnecessary_first_then_check)]
 mod tests {
     use super::*;
 
     use std::io;
+    use std::io::prelude::*;
+    use std::os::unix::net::UnixStream;
     use std::thread;
     use std::time::Duration;
 

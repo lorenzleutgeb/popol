@@ -13,3 +13,7 @@ license = "MIT"
 
 [dependencies]
 libc = "0.2.134"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.61.3"
+features = ["Win32_Networking_WinSock"]
